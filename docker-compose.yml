@@ -1,0 +1,53 @@
+services:
+  db:
+    image: postgres:16.3-alpine
+    environment:
+      POSTGRES_USER: ladder
+      POSTGRES_PASSWORD: ladder
+      POSTGRES_DB: ladder
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ladder -d ladder" ]
+      interval: 3s
+      retries: 15
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  cache:
+    image: redis:7.2.5-alpine
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 3s
+      retries: 15
+  migrate:
+    image: postgres:16.3-alpine
+    environment:
+      PGPASSWORD: ladder
+    volumes:
+      - ./migrations:/migrations:ro
+    command: >
+      sh -c 'for f in /migrations/*.sql; do
+               echo "applying $$f";
+               psql -h db -U ladder -d ladder -v ON_ERROR_STOP=1 -f "$$f" || exit 1;
+             done; echo "migrations done"'
+    depends_on:
+      db: { condition: service_healthy }
+
+  app:
+    build: .
+    image: elo-ladder:1.0
+    ports:
+      - "8080:8080"
+    environment:
+
+      DATABASE_URL: jdbc:postgresql://db:5432/ladder
+      DB_USER: ladder
+      DB_PASSWORD: ladder
+      REDIS_HOST: cache
+      REDIS_PORT: "6379"
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
