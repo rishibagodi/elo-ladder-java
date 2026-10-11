@@ -1,0 +1,15 @@
+# Only pom.xml and src/ are needed to build the image.
+target/
+.git/
+.gitignore
+.circleci/
+.idea/
+.vscode/
+*.iml
+kube/
+migrations/
+docker-compose.yml
+Dockerfile
+.dockerignore
+README.md
+.env
