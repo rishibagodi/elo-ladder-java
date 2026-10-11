@@ -38,7 +38,9 @@ comes from this table.
 ```
 GET  /health                    is it alive, and are Postgres and Redis reachable
 GET  /players                   every player, strongest first
-POST /players                   {"name": "Anand"}
+POST /players                   {"name": "Anand"}           201, or 409 if the name is taken
+PUT  /players/{id}              {"name": "Anand K"}         rename; 404 unknown id, 409 name taken
+DELETE /players/{id}                                        204; 409 if the player has matches
 GET  /ladder                    the ladder, from a Redis sorted set
 POST /matches                   {"playerA": 1, "playerB": 2, "scoreA": 1}
 ```
