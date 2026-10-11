@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Map;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -41,6 +43,7 @@ public class LadderController {
     public Map<String, Object> root() {
         return Map.of("service", "elo-ladder",
                 "endpoints", List.of("GET /health", "GET /players", "POST /players",
+                        "PUT /players/{id}", "DELETE /players/{id}",
                         "GET /ladder", "POST /matches"));
     }
 
@@ -51,17 +54,67 @@ public class LadderController {
     }
 
     @PostMapping("/players")
-    public ResponseEntity<?> addPlayer(@RequestBody Map<String, String> body) {
-        String name = body.getOrDefault("name", "").trim();
+    public ResponseEntity<?> addPlayer(@RequestBody Map<String, Object> body) {
+        String name = nameFrom(body);
         if (name.isEmpty()) {
             return ResponseEntity.badRequest().body(Map.of("error", "name is required"));
         }
-        Integer id = jdbc.queryForObject(
-                "INSERT INTO players (name, rating, games_played) VALUES (?, ?, 0) RETURNING id",
-                Integer.class, name, Elo.STARTING_RATING);
+        Integer id;
+        try {
+            id = jdbc.queryForObject(
+                    "INSERT INTO players (name, rating, games_played) VALUES (?, ?, 0) RETURNING id",
+                    Integer.class, name, Elo.STARTING_RATING);
+        } catch (DuplicateKeyException e) {
+            return nameTaken(name);
+        }
         redis.opsForZSet().add(LADDER_KEY, name, Elo.STARTING_RATING);
         return ResponseEntity.status(201).body(
                 Map.of("id", id, "name", name, "rating", Elo.STARTING_RATING));
+    }
+
+    /** Rename a player. Rating and match history are kept. */
+    @PutMapping("/players/{id}")
+    public ResponseEntity<?> renamePlayer(@PathVariable int id, @RequestBody Map<String, Object> body) {
+        String name = nameFrom(body);
+        if (name.isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of("error", "name is required"));
+        }
+        Map<String, Object> p = one(id);
+        if (p == null) {
+            return ResponseEntity.status(404).body(Map.of("error", "no such player"));
+        }
+        try {
+            jdbc.update("UPDATE players SET name = ? WHERE id = ?", name, id);
+        } catch (DuplicateKeyException e) {
+            return nameTaken(name);
+        }
+
+        // The Redis ladder is keyed by name, so the old entry must go or the
+        // player would appear twice - once under each name.
+        int rating = asInt(p.get("rating"));
+        redis.opsForZSet().remove(LADDER_KEY, (String) p.get("name"));
+        redis.opsForZSet().add(LADDER_KEY, name, rating);
+
+        return ResponseEntity.ok(Map.of("id", id, "name", name, "rating", rating,
+                "games_played", asInt(p.get("games_played"))));
+    }
+
+    /** Delete a player who has never played. Match history is never thrown away. */
+    @DeleteMapping("/players/{id}")
+    public ResponseEntity<?> deletePlayer(@PathVariable int id) {
+        Map<String, Object> p = one(id);
+        if (p == null) {
+            return ResponseEntity.status(404).body(Map.of("error", "no such player"));
+        }
+        try {
+            jdbc.update("DELETE FROM players WHERE id = ?", id);
+        } catch (DataIntegrityViolationException e) {
+            // matches.player_a / player_b reference this row
+            return ResponseEntity.status(409).body(Map.of("error",
+                    "player has recorded matches and cannot be deleted"));
+        }
+        redis.opsForZSet().remove(LADDER_KEY, (String) p.get("name"));
+        return ResponseEntity.noContent().build();
     }
 
     /** Report a result. scoreA: 1 = A won, 0.5 = draw, 0 = B won. */
@@ -149,6 +202,16 @@ public class LadderController {
         var rows = jdbc.queryForList(
                 "SELECT id, name, rating, games_played FROM players WHERE id = ?", id);
         return rows.isEmpty() ? null : rows.get(0);
+    }
+
+    /** The trimmed "name" field, or "" if it is missing or null. */
+    private static String nameFrom(Map<String, Object> body) {
+        Object v = body.get("name");
+        return v == null ? "" : v.toString().trim();
+    }
+
+    private static ResponseEntity<Map<String, String>> nameTaken(String name) {
+        return ResponseEntity.status(409).body(Map.of("error", "a player named '" + name + "' already exists"));
     }
 
     private static Integer asInt(Object o) {
