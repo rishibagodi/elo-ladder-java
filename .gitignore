@@ -1,0 +1,10 @@
+# build output - regenerated on every build, never commit
+target/
+
+# IDE / editor
+.vscode/
+.idea/
+*.iml
+
+# secrets
+.env
