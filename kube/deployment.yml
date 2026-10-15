@@ -1,0 +1,140 @@
+# All Deployments: the app, plus the Postgres and Redis it depends on.
+# Namespace-free on purpose - the same file is applied to qa, stage and prod:
+#
+#   kubectl apply -f kube/deployment.yml -n qa
+#   (Get-Content kube/deployment.yml) -replace 'elo-ladder:qa','elo-ladder:stage' | kubectl apply -n stage -f -
+#   (Get-Content kube/deployment.yml) -replace 'elo-ladder:qa','elo-ladder:prod'  | kubectl apply -n prod  -f -
+
+# ---------------------------------------------------------------- the app
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elo-ladder
+spec:
+  replicas: 3
+  selector:
+    # A Deployment owns a label, not a list of Pods: it keeps exactly
+    # `replicas` Pods with app=elo-ladder alive, replacing any that die.
+    matchLabels:
+      app: elo-ladder
+  template:
+    metadata:
+      labels:
+        app: elo-ladder
+    spec:
+      # Docker Hub login for pulling the image. Secrets are namespaced, so a
+      # "dockerhub" Secret must exist in each of qa, stage and prod.
+      imagePullSecrets:
+        - name: dockerhub
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001            # the 'app' user created in the Dockerfile
+      containers:
+        - name: app
+          image: rishibagodi/elo-ladder:qa     # :stage / :prod substituted at apply time
+          # Moving tags point at a new image on every pipeline run. Always makes
+          # the node check Docker Hub instead of reusing a cached image.
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8080
+          env:
+            - name: DATABASE_URL
+              value: jdbc:postgresql://db:5432/ladder
+            - name: DB_USER
+              value: ladder
+            - name: DB_PASSWORD
+              value: ladder
+            - name: REDIS_HOST
+              value: cache
+            - name: REDIS_PORT
+              value: "6379"
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits:   { cpu: "1",  memory: 512Mi }
+          readinessProbe:
+            # Kept out of the Service until /health passes - it returns 503
+            # while Postgres or Redis is unreachable.
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+---
+# ---------------------------------------------------------------- Postgres
+# One replica, data in an emptyDir: when this Pod dies the database starts
+# empty and re-runs the migrations. Must stay at 1 - two Postgres Pods would
+# be two separate databases behind one Service.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.3-alpine
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_USER
+              value: ladder
+            - name: POSTGRES_PASSWORD
+              value: ladder
+            - name: POSTGRES_DB
+              value: ladder
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            # Postgres runs every .sql here, in filename order, on first start.
+            # Replaces the "migrate" service from docker-compose. The ConfigMap
+            # is made from the real files:
+            #   kubectl create configmap ladder-migrations --from-file=migrations/ -n <ns>
+            - name: migrations
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "ladder", "-d", "ladder"]
+            periodSeconds: 3
+      volumes:
+        - name: migrations
+          configMap:
+            name: ladder-migrations
+        - name: pgdata
+          emptyDir: {}
+---
+# ---------------------------------------------------------------- Redis
+# Only a cache: if it restarts empty, GET /ladder rebuilds it from Postgres.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cache
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cache
+  template:
+    metadata:
+      labels:
+        app: cache
+    spec:
+      containers:
+        - name: redis
+          image: redis:7.2.5-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 3
