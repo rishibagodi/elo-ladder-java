@@ -1,0 +1,37 @@
+# A bare Pod, for contrast only - this is NOT how the app runs.
+# Delete it and nothing brings it back; no Deployment is watching it.
+#
+#   kubectl apply -f kube/pod.yml -n qa
+#   kubectl delete pod elo-ladder-bare -n qa      # gone for good
+#
+# The label is deliberately NOT app=elo-ladder, so the Service does not pick
+# this Pod up as a fourth backend, and the Deployment does not adopt it.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: elo-ladder-bare
+  labels:
+    app: elo-ladder-bare
+spec:
+  imagePullSecrets:
+    - name: dockerhub
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+  containers:
+    - name: app
+      image: rishibagodi/elo-ladder:qa
+      imagePullPolicy: Always
+      ports:
+        - containerPort: 8080
+      env:
+        - name: DATABASE_URL
+          value: jdbc:postgresql://db:5432/ladder
+        - name: DB_USER
+          value: ladder
+        - name: DB_PASSWORD
+          value: ladder
+        - name: REDIS_HOST
+          value: cache
+        - name: REDIS_PORT
+          value: "6379"
