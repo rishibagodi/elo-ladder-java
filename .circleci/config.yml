@@ -1,0 +1,197 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# What runs where
+#   main (QA)           secret-scan -> lint -> unit -> integration -> build & push :qa
+#   staging             build & push :stage   (no tests)
+#   prod                build & push :prod    (no tests)
+#   feature branches    the four checks only, nothing pushed (so PRs show green/red)
+#
+# Every push also gets an immutable tag  <branch>-<short-sha>,  e.g. main-4cfa0e6,
+# which is how you prove which commit a Kubernetes pod is running.
+#
+# Needs two CircleCI project environment variables (never in the repo):
+#   DOCKERHUB_USER    your Docker Hub username
+#   DOCKERHUB_TOKEN   a Docker Hub access token (not your password)
+# ---------------------------------------------------------------------------
+
+executors:
+  java:
+    docker:
+      - image: cimg/openjdk:17.0
+
+commands:
+  # Maven downloads ~100 MB of dependencies; cache them, keyed on pom.xml.
+  restore-m2:
+    steps:
+      - restore_cache:
+          keys:
+            - m2-v1-{{ checksum "pom.xml" }}
+            - m2-v1-
+  save-m2:
+    steps:
+      - save_cache:
+          key: m2-v1-{{ checksum "pom.xml" }}
+          paths:
+            - ~/.m2
+
+jobs:
+  secret-scan:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - run:
+          name: Install gitleaks
+          command: |
+            V=8.18.4
+            curl -sSL -o /tmp/g.tar.gz \
+              "https://github.com/gitleaks/gitleaks/releases/download/v${V}/gitleaks_${V}_linux_x64.tar.gz"
+            tar -xzf /tmp/g.tar.gz -C /tmp gitleaks
+            sudo mv /tmp/gitleaks /usr/local/bin/
+      - run:
+          name: Scan the whole git history for secrets
+          command: gitleaks detect --source . --redact --verbose --report-path gitleaks.json
+      - store_artifacts:
+          path: gitleaks.json
+
+  lint:
+    executor: java
+    steps:
+      - checkout
+      - restore-m2
+      - run:
+          name: Checkstyle
+          command: mvn -B checkstyle:check
+      - save-m2
+
+  unit:
+    executor: java
+    steps:
+      - checkout
+      - restore-m2
+      - run:
+          name: Unit tests + 70% coverage gate on Elo (no DB, no network)
+          command: mvn -B verify -DskipITs
+      - save-m2
+      - store_test_results:
+          path: target/surefire-reports
+      - store_artifacts:
+          path: target/site/jacoco
+          destination: coverage
+
+  integration:
+    docker:
+      - image: cimg/openjdk:17.0
+      # Service containers share the job's network, so they are on localhost
+      # here - unlike docker-compose, where the app reaches them as db / cache.
+      - image: cimg/postgres:16.3
+        environment:
+          POSTGRES_USER: ladder
+          POSTGRES_PASSWORD: ladder
+          POSTGRES_DB: ladder
+      - image: cimg/redis:7.2
+    environment:
+      DATABASE_URL: jdbc:postgresql://localhost:5432/ladder
+      DB_USER: ladder
+      DB_PASSWORD: ladder
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+      PGPASSWORD: ladder
+    steps:
+      - checkout
+      - restore-m2
+      - run:
+          name: Install psql client
+          command: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - run:
+          name: Wait for Postgres and Redis
+          command: |
+            for i in $(seq 1 30); do
+              pg_isready -h localhost -U ladder -d ladder && break
+              sleep 2
+            done
+            for i in $(seq 1 30); do
+              (echo > /dev/tcp/localhost/6379) 2>/dev/null && break
+              sleep 2
+            done
+      - run:
+          name: Apply migrations in filename order
+          command: |
+            for f in migrations/*.sql; do
+              echo "applying $f"
+              psql -h localhost -U ladder -d ladder -v ON_ERROR_STOP=1 -f "$f"
+            done
+      - run:
+          name: Integration tests (*IT.java) against real Postgres + Redis
+          command: mvn -B verify -DskipUnitTests=true -Djacoco.skip=true
+      - save-m2
+      - store_test_results:
+          path: target/failsafe-reports
+
+  build-push:
+    parameters:
+      tag:
+        type: string
+        description: the moving tag for this branch - qa, stage or prod
+    docker:
+      - image: cimg/base:current
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+          name: Build image
+          command: |
+            IMAGE="$DOCKERHUB_USER/elo-ladder"
+            IMMUTABLE="${CIRCLE_BRANCH}-${CIRCLE_SHA1:0:7}"
+            docker build -t "$IMAGE:<< parameters.tag >>" -t "$IMAGE:$IMMUTABLE" .
+      - run:
+          name: Push :<< parameters.tag >> and :<branch>-<short-sha>
+          command: |
+            IMAGE="$DOCKERHUB_USER/elo-ladder"
+            IMMUTABLE="${CIRCLE_BRANCH}-${CIRCLE_SHA1:0:7}"
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+            docker push "$IMAGE:<< parameters.tag >>"
+            docker push "$IMAGE:$IMMUTABLE"
+            echo "pushed $IMAGE:<< parameters.tag >> and $IMAGE:$IMMUTABLE"
+
+workflows:
+  pipeline:
+    jobs:
+      # ---- checks: every branch except staging and prod ----
+      - secret-scan:
+          filters: &not-stage-or-prod
+            branches:
+              ignore: [staging, prod]
+      - lint:
+          requires: [secret-scan]
+          filters: *not-stage-or-prod
+      - unit:
+          requires: [lint]
+          filters: *not-stage-or-prod
+      - integration:
+          requires: [unit]
+          filters: *not-stage-or-prod
+
+      # ---- main (QA): full pipeline, then push :qa ----
+      - build-push:
+          name: build-push-qa
+          tag: qa
+          requires: [integration]
+          filters:
+            branches:
+              only: main
+
+      # ---- staging and prod: build only ----
+      - build-push:
+          name: build-push-stage
+          tag: stage
+          filters:
+            branches:
+              only: staging
+      - build-push:
+          name: build-push-prod
+          tag: prod
+          filters:
+            branches:
+              only: prod
